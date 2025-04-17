@@ -8,9 +8,9 @@ import logging
 import numpy as np
 import torch
 import torch.optim as optim
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils import data
-
+from datetime import datetime
 import src.utils as utils
 from src.dataset import infinite_data_loader
 from src.dataset.talkinghead_dataset_hungry import TalkingHeadDatasetHungry
@@ -18,7 +18,7 @@ from src.modules.dit_talking_head import DitTalkingHead
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-def train(args, model, train_loader, val_loader, optimizer, save_dir, scheduler=None, writer=None, ):
+def train(args, model, train_loader, optimizer, save_dir, scheduler=None, writer=None, ):
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # model
@@ -27,119 +27,27 @@ def train(args, model, train_loader, val_loader, optimizer, save_dir, scheduler=
 
     # data
     data_loader = infinite_data_loader(train_loader)
-    audio_unit = train_loader.dataset.audio_unit
-    predict_head_pose = not args.no_head_pose
     loss_log = defaultdict(lambda: deque(maxlen=args.log_smooth_win))
 
     optimizer.zero_grad()
     for it in range(args.max_iter + 1):
         # Load data
-        audio_pair, coef_pair = next(data_loader)
-        audio_pair = [audio.to(device) for audio in audio_pair]
-        coef_pair = [{x: coef_pair[i][x].to(device) for x in coef_pair[i]} for i in range(2)]
-        motion_coef_pair = [
-            utils.get_motion_coef(coef_pair[i], args.rot_repr, predict_head_pose) for i in range(2)
-        ] 
+        batch = next(data_loader)
+        z_src, z_tgt = batch['z_src'], batch['z_tgt']
+        past_audio_feats = batch['past_audio_feats']
+        curr_audio_feats = batch['curr_audio_feats']
 
-        # Extract audio features
-        if args.use_context_audio_feat:
-            audio_feat = model.extract_audio_feature(torch.cat(audio_pair, dim=1), args.n_motions * 2)  # (N, 2L, :)
+        noise, target, _, _ = model(motion_feat = z_tgt,
+                                    audio_or_feat = curr_audio_feats,
+                                    prev_motion_feat = z_src,
+                                    prev_audio_feat = past_audio_feats,
+                                    time_step=None, # Randomly sampled if None
+                                    )
 
-        loss_noise = 0
-        loss_exp = torch.tensor(0, device=device)
-        loss_exp_v = torch.tensor(0, device=device)
-        loss_exp_s = torch.tensor(0, device=device)
-        loss_head_angle = torch.tensor(0, device=device)
-        loss_head_vel = torch.tensor(0, device=device)
-        loss_head_smooth = torch.tensor(0, device=device)
-        loss_head_trans = 0
-        for i in range(2):
-            audio = audio_pair[i]  # (N, L_a)
-            motion_coef = motion_coef_pair[i]  # (N, L, 50+x)
-            batch_size = audio.shape[0]
-
-            # truncate input audio and motion according to trunc_prob
-            if (i == 0 and np.random.rand() < args.trunc_prob1) or (i != 0 and np.random.rand() < args.trunc_prob2):
-                audio_in, motion_coef_in, end_idx = utils.truncate_motion_coef_and_audio(
-                    audio, motion_coef, args.n_motions, audio_unit, args.pad_mode)
-                if args.use_context_audio_feat and i != 0:
-                    # use contextualized audio feature for the second clip
-                    audio_in = model.extract_audio_feature(torch.cat([audio_pair[i - 1], audio_in], dim=1),
-                                                           args.n_motions * 2)[:, -args.n_motions:]
-            else:
-                if args.use_context_audio_feat:
-                    audio_in = audio_feat[:, i * args.n_motions:(i + 1) * args.n_motions]
-                else:
-                    audio_in = audio
-                motion_coef_in, end_idx = motion_coef, None
-
-            if args.use_indicator:
-                if end_idx is not None:
-                    indicator = torch.arange(args.n_motions, device=device).expand(batch_size, -1) < end_idx.unsqueeze(
-                        1)
-                else:
-                    indicator = torch.ones(batch_size, args.n_motions, device=device)
-            else:
-                indicator = None
-
-            # Inference
-            if i == 0:
-                noise, target, prev_motion_coef, prev_audio_feat = model(motion_coef_in, audio_in, indicator=indicator)
-                if end_idx is not None:  # was truncated, needs to use the complete feature
-                    prev_motion_coef = motion_coef[:, -args.n_prev_motions:]
-                    if args.use_context_audio_feat:
-                        prev_audio_feat = audio_feat[:, args.n_motions - args.n_prev_motions:args.n_motions].detach()
-                    else:
-                        with torch.no_grad():
-                            prev_audio_feat = model.extract_audio_feature(audio)[:, -args.n_prev_motions:]
-                else:
-                    prev_motion_coef = prev_motion_coef[:, -args.n_prev_motions:]
-                    prev_audio_feat = prev_audio_feat[:, -args.n_prev_motions:]
-            else:
-                noise, target, _, _ = model(motion_coef_in, audio_in, prev_motion_coef, prev_audio_feat, indicator=indicator)
-
-            loss_n, loss_exp, loss_exp_v, loss_exp_s, loss_ha, loss_hc, loss_hs, loss_ht = utils.compute_loss_new(args, i == 0, motion_coef_in, noise, target, prev_motion_coef, end_idx)
-            loss_noise = loss_noise + loss_n / 2
-            loss_exp = loss_exp + loss_exp / 2
-            loss_exp_v = loss_exp_v + loss_exp_v / 2.
-            loss_exp_s = loss_exp_s + loss_exp_s / 2.
-            if args.target == 'sample' and predict_head_pose and args.l_head_angle > 0:
-                loss_head_angle = loss_head_angle + loss_ha / 2
-            if args.target == 'sample' and predict_head_pose and args.l_head_vel > 0 and loss_hc is not None:
-                loss_head_vel = loss_head_vel + loss_hc / 2
-            if args.target == 'sample' and predict_head_pose and args.l_head_smooth > 0 and loss_hs is not None:
-                loss_head_smooth = loss_head_smooth + loss_hs / 2
-            if args.target == 'sample' and predict_head_pose and args.l_head_trans > 0 and loss_ht is not None:
-                # no need to divide by 2 because it only applies to the second clip
-                loss_head_trans = loss_head_trans + loss_ht
+        loss_noise = torch.nn.functional.mse_loss(noise,target)
 
         loss_log['noise'].append(loss_noise.item())
         loss = loss_noise
-
-        loss_log['exp'].append(loss_exp.item() * args.l_exp)
-        loss = loss + args.l_exp * loss_exp
-
-        loss_log['exp_vel'].append(loss_exp_v.item() * args.l_exp_vel)
-        loss = loss + args.l_exp_vel * loss_exp_v
-
-        loss_log['exp_smooth'].append(loss_exp_s.item() * args.l_exp_smooth)
-        loss = loss + args.l_exp_smooth * loss_exp_s
-
-        if args.target == 'sample' and predict_head_pose and args.l_head_angle > 0:
-            loss_log['head_angle'].append(loss_head_angle.item() * args.l_head_angle)
-            loss = loss + args.l_head_angle * loss_head_angle
-
-        if args.target == 'sample' and predict_head_pose and args.l_head_vel > 0:
-            loss_log['head_vel'].append(loss_head_vel.item() * args.l_head_vel)
-            loss = loss + args.l_head_vel * loss_head_vel
-
-        if args.target == 'sample' and predict_head_pose and args.l_head_smooth > 0:
-            loss_log['head_smooth'].append(loss_head_smooth.item() * args.l_head_smooth)
-            loss = loss + args.l_head_smooth * loss_head_smooth
-        
-        if args.target == 'sample' and predict_head_pose and args.l_head_trans > 0:
-            loss_log['head_trans'].append(loss_head_trans.item() * args.l_head_trans)
-            loss = loss + args.l_head_trans * loss_head_trans
 
         loss.backward()
 
@@ -152,36 +60,13 @@ def train(args, model, train_loader, val_loader, optimizer, save_dir, scheduler=
 
         # Logging
         loss_log['loss'].append(loss.item())
-        description = f'Iter: {it}\t  Train loss: [N: {np.mean(loss_log["noise"]):.3e}'
-        description += f", EX: {np.mean(loss_log['exp']):.3e}"
-        description += f", EX_V: {np.mean(loss_log['exp_vel']):.3e}"
-        description += f", EX_S: {np.mean(loss_log['exp_smooth']):.3e}"
-        if args.target == 'sample' and predict_head_pose and args.l_head_angle > 0:
-            description += f', HA: {np.mean(loss_log["head_angle"]):.3e}'
-        if args.target == 'sample' and predict_head_pose and args.l_head_vel > 0:
-            description += f', HV: {np.mean(loss_log["head_vel"]):.3e}'
-        if args.target == 'sample' and predict_head_pose and args.l_head_smooth > 0:
-            description += f', HS: {np.mean(loss_log["head_smooth"]):.3e}'
-        if args.target == 'sample' and predict_head_pose and args.l_head_trans > 0:
-            description += f', HT: {np.mean(loss_log["head_trans"]):.3e}'
-        description += ']'
+        description = f'Iter: {it}\t  Train loss: [N: {np.mean(loss_log["noise"]):.3e}]'
         logging.info(description)
 
         # write to tensorboard
         if it % args.log_iter == 0 and writer is not None:
             writer.add_scalar('train/total_loss', np.mean(loss_log['loss']), it)
             writer.add_scalar('train/simple_loss', np.mean(loss_log['noise']), it)
-            writer.add_scalar('train/exp_loss', np.mean(loss_log['exp']), it)
-            writer.add_scalar('train/exp_vel_loss', np.mean(loss_log['exp_vel']), it)
-            writer.add_scalar('train/exp_smooth_loss', np.mean(loss_log['exp_smooth']), it)
-            if args.target == 'sample' and predict_head_pose and args.l_head_angle > 0:
-                writer.add_scalar('train/head_angle', np.mean(loss_log['head_angle']), it)
-            if args.target == 'sample' and predict_head_pose and args.l_head_vel > 0:
-                writer.add_scalar('train/head_vel', np.mean(loss_log['head_vel']), it)
-            if args.target == 'sample' and predict_head_pose and args.l_head_smooth > 0:
-                writer.add_scalar('train/head_smooth', np.mean(loss_log['head_smooth']), it)
-            if args.target == 'sample' and predict_head_pose and args.l_head_trans > 0:
-                writer.add_scalar('train/head_trans', np.mean(loss_log['head_trans']), it)
             writer.add_scalar('opt/lr', optimizer.param_groups[0]['lr'], it)
 
         # update learning rate
@@ -198,8 +83,8 @@ def train(args, model, train_loader, val_loader, optimizer, save_dir, scheduler=
             }, save_dir / f'iter_{it:07}.pt')
 
         # validation
-        if (it % args.val_iter == 0 or it == 0) or it == args.max_iter:
-            val(args, model, val_loader, it, 1, 'val', writer)
+        # if (it % args.val_iter == 0 or it == 0) or it == args.max_iter:
+        #     val(args, model, val_loader, it, 1, 'val', writer)
 
 
 @torch.no_grad()
@@ -367,6 +252,10 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def main(args, option_text=None):
+
+    # ------------------------ SETUP ------------------------
+    torch.multiprocessing.set_start_method('spawn', force=True)
+
     # model
     model_kwargs = dict(
         device = device,
@@ -386,17 +275,12 @@ def main(args, option_text=None):
     model = DitTalkingHead(**model_kwargs)
 
     # Dataset
-    train_dataset = TalkingHeadDatasetHungry(args.data_root, motion_filename=args.motion_filename, 
-                                             motion_templete_filename=args.motion_templete_filename, split="train", coef_fps=args.fps, n_motions=args.n_motions, 
-                                             crop_strategy=args.crop_strategy, normalize_type=args.normalize_type)
-    val_dataset = TalkingHeadDatasetHungry(args.data_root, motion_filename=args.motion_filename, 
-                                           motion_templete_filename=args.motion_templete_filename, split="val", coef_fps=args.fps, n_motions=args.n_motions, 
-                                           crop_strategy=args.crop_strategy, normalize_type=args.normalize_type)
-    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-    val_loader = data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    from src.lsm_audio2video.dataset import LEAPFeatsDataset
+    train_dataset = LEAPFeatsDataset(root_dir=args.data_root_dir, leap_av_clips_dir=args.leap_av_clips_dir)
+    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=False)
 
     # Logging
-    exp_dir = Path('experiments/JoyVASA') / f'{args.exp_name}'
+    exp_dir = Path('experiments/JoyVASA') / f'{args.exp_name}_{datetime.now().strftime("%Y/%m/%d_%H:%M:%S")}'
     log_dir = exp_dir / 'logs'
     log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(str(log_dir))
@@ -428,7 +312,7 @@ def main(args, option_text=None):
         scheduler = None
 
     # train
-    train(args, model, train_loader, val_loader, optimizer, exp_dir / 'checkpoints', scheduler, writer)
+    train(args, model, train_loader, optimizer, exp_dir / 'checkpoints', scheduler, writer)
 
 
 if __name__ == '__main__':
@@ -438,13 +322,10 @@ if __name__ == '__main__':
     parser.add_argument('--exp_name', type=str, default='test_b16', help='experiment name')
 
     # Dataset
-    parser.add_argument('--data_root', type=Path, default="data/",)
-    parser.add_argument('--motion_filename', type=str, default='motions.pkl')
-    parser.add_argument('--motion_templete_filename', type=str, default='motion_templete.pkl')
+    parser.add_argument('--data_root_dir', type=Path, required=True, help='/path/to/lsm_checkpoint/a2v_dataset/dataset')
+    parser.add_argument('--leap_av_clips_dir', type=Path, required=True,)
     parser.add_argument('--batch_size', type=int, default=16, help='batch size')
     parser.add_argument('--num_workers', type=int, default=4, help='number of workers for dataloader')
-    parser.add_argument('--crop_strategy', type=str, default="random")
-    parser.add_argument('--normalize_type', type=str, default="mix", choices=["std", "case", "scale", "minmax", "mix"])
 
     # Model
     parser.add_argument('--target', type=str, default='sample', choices=['sample', 'noise'])
@@ -467,9 +348,9 @@ if __name__ == '__main__':
     parser.add_argument('--mlp_ratio', type=int, default=4, help='ratio of the hidden dimension of the MLP')
 
     # sequence
-    parser.add_argument('--n_motions', type=int, default=100, help='number of motions in a sequence')
-    parser.add_argument('--n_prev_motions', type=int, default=25, help='number of pre-motions in a sequence')
-    parser.add_argument('--motion_feat_dim', type=int, default=70)
+    parser.add_argument('--n_motions', type=int, default=50, help='number of motions in a sequence')
+    parser.add_argument('--n_prev_motions', type=int, default=50, help='number of pre-motions in a sequence')
+    parser.add_argument('--motion_feat_dim', type=int, default=20)
     parser.add_argument('--fps', type=int, default=25, help='frame per second')
     parser.add_argument('--pad_mode', type=str, default='zero', choices=['zero', 'replicate'])
 

@@ -138,6 +138,11 @@ class DitTalkingHead(nn.Module):
         """
         batch_size = motion_feat.shape[0]
 
+        # Map audio features
+        audio_or_feat = self.audio_feature_map(audio_or_feat)
+        if prev_audio_feat is not None:
+            prev_audio_feat = self.audio_feature_map(prev_audio_feat)
+
         # 加载语音特征
         if audio_or_feat.ndim == 2: # 原始语音
             # Extract audio features
@@ -457,13 +462,14 @@ class DenoisingNetwork(nn.Module):
         if self.architecture == 'decoder':
             audio_feat_in = torch.cat([prev_audio_feat, audio_feat], dim=1)  # (N, L_p + L, d_audio)
             # print(f"feats_in: {feats_in.shape}, audio_feat_in: {audio_feat_in.shape}, memory_mask: {self.alignment_mask.shape}")
-            feat_out = self.transformer(feats_in, audio_feat_in, memory_mask=self.alignment_mask)
+            feat_out = self.transformer(feats_in, audio_feat_in,)
         else:
             raise ValueError(f'Unknown architecture: {self.architecture}')
 
         # Decode predicted motion feature noise / sample
         # motion_feat_target = self.motion_dec(feat_out[:, 1:])  # (N, L_p + L, d_motion)
         motion_feat_target = self.motion_dec(feat_out)  # (N, L_p + L, d_motion)
+        motion_feat_target = motion_feat_target[:, prev_motion_feat.shape[1]:]  # (N, L, d_motion)
 
         return motion_feat_target
 
