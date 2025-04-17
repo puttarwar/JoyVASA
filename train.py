@@ -115,6 +115,7 @@ def val(args, model, log_dir, current_iter, num_videos=10):
     out_dir  = Path(log_dir)/f'eval_{current_iter}'
     out_dir.mkdir(parents=True, exist_ok=True)
     sys.path.append('/hdd/Codes/rotation3d/')
+    sys.path.append('/home/azureuser/Codes/rotation3d')
     from lsm.inference import load
     lsm_model  = load(args.lsm_checkpoint_path, strict=False,map_location=device)[0]
     wav2vec2   = Wav2Vec2()
