@@ -135,7 +135,7 @@ def val(args, model, log_dir, current_iter):
 
         # Extract zs
         frame0 = video[0, None]
-        frame0_enc = lsm_model.lsm_model.encoder(frame0)
+        frame0_enc = lsm_model.encoder(frame0)
         z_src = None
 
         z_outs = []
