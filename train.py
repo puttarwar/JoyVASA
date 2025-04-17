@@ -76,14 +76,15 @@ def train(args, model, train_loader, optimizer, save_dir, scheduler=None, writer
 
         # Logging
         loss_log['loss'].append(loss.item())
-        description = f'Iter: {it}\t  Train loss: [N: {np.mean(loss_log["noise"]):.3e}]'
-        logging.info(description)
+
 
         # write to tensorboard
         if it % args.log_iter == 0 and writer is not None:
             writer.add_scalar('train/total_loss', np.mean(loss_log['loss']), it)
             writer.add_scalar('train/simple_loss', np.mean(loss_log['noise']), it)
             writer.add_scalar('opt/lr', optimizer.param_groups[0]['lr'], it)
+            description = f'Iter: {it}\t  Train loss: [N: {np.mean(loss_log["noise"]):.3e}]'
+            logging.info(description)
 
         # update learning rate
         if scheduler is not None:
@@ -132,7 +133,6 @@ def val(args, model, log_dir, current_iter, num_videos=10):
 
     for video_file in video_files:
         video, audio = get_leap_clip_data(video_file, device)
-        print(f'Processing {video_file}...')
 
         # Extract audio features
         audio_feats = wav2vec2(audio[None,:,0])  # (1, L, 768)
@@ -324,10 +324,10 @@ if __name__ == '__main__':
     parser.add_argument('--trunc_prob1', type=float, default=0.3, help='truncation probability for the first sample')
     parser.add_argument('--trunc_prob2', type=float, default=0.4, help='truncation probability for the second sample')
 
-    parser.add_argument('--save_iter', type=int, default=1000, help='save model every x iterations')
-    parser.add_argument('--val_iter', type=int, default=50, help='validate every x iterations')
-    parser.add_argument('--log_iter', type=int, default=50, help='log to tensorboard every x iterations')
-    parser.add_argument('--log_smooth_win', type=int, default=50, help='smooth window for logging')
+    parser.add_argument('--save_iter', type=int, default=5000, help='save model every x iterations')
+    parser.add_argument('--val_iter', type=int, default=5000, help='validate every x iterations')
+    parser.add_argument('--log_iter', type=int, default=500, help='log to tensorboard every x iterations')
+    parser.add_argument('--log_smooth_win', type=int, default=500, help='smooth window for logging')
 
     # warm_up
     parser.add_argument('--warm_iter', type=int, default=2000)
