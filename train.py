@@ -280,8 +280,8 @@ def main(args, option_text=None):
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=False)
 
     # Logging
-    exp_dir = Path('experiments/JoyVASA') / f'{args.exp_name}_{datetime.now().strftime("%Y/%m/%d_%H:%M:%S")}'
-    log_dir = exp_dir / 'logs'
+    exp_dir = Path(args.data_root_dir).parents[1]/f'{args.exp_name}_{datetime.now().strftime("%Y%m%d_%H_%M_%S")}'
+    log_dir = exp_dir
     log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(str(log_dir))
     if option_text is not None:
@@ -319,7 +319,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
     parser.add_argument('--iter', type=int, default=1, help='iteration to test')
-    parser.add_argument('--exp_name', type=str, default='test_b16', help='experiment name')
+    parser.add_argument('--exp_name', type=str, default='joyvasa', help='experiment name')
 
     # Dataset
     parser.add_argument('--data_root_dir', type=Path, required=True, help='/path/to/lsm_checkpoint/a2v_dataset/dataset')
