@@ -50,6 +50,7 @@ def train(args, model, train_loader, optimizer, save_dir, scheduler=None, writer
         # Load data
         batch = next(data_loader)
         z_src, z_tgt = batch['z_src'], batch['z_tgt']
+        z_tgt        = z_tgt - z_src.mean(dim=1, keepdim=True)  # [B, N, 20]
         past_audio_feats = batch['past_audio_feats']
         curr_audio_feats = batch['curr_audio_feats']
 
@@ -164,6 +165,7 @@ def val(args, model, log_dir, current_iter, num_videos=10):
             # Run Diffusion
             outs = model.sample(audio_or_feat=curr_audio, prev_motion_feat=z_src, prev_audio_feat=past_audio)
             z_tgt_pred = outs[0][:, -video_pred_len:]  # [1, N, 20]
+            z_tgt_pred = z_tgt_pred + z_src.mean(dim=1, keepdim=True)  # [1, N, 20]
 
             # Generate images
             src_encs = batch_broadcast(frame0_enc, len(video_batch))
