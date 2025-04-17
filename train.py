@@ -26,11 +26,13 @@ import src.utils as utils
 from src.dataset import infinite_data_loader
 from src.modules.dit_talking_head import DitTalkingHead
 import glob
+from torchvision.io import write_video
 from more_itertools import batched
 from src.lsm_audio2video.audio_processors.wave2vec2 import Wav2Vec2
 from src.lsm_audio2video.utils.utils import get_leap_clip_data, batch_broadcast
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+torch.set_default_device(device)
 
 def train(args, model, train_loader, optimizer, save_dir, scheduler=None, writer=None, ):
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -109,9 +111,11 @@ def val(args, model, log_dir, current_iter):
     model.eval()
 
     #  ------------ SETUP (LSM MODEL, DATA) ------------
+    out_dir  = Path(log_dir)/f'eval_{current_iter}'
+    out_dir.mkdir(parents=True, exist_ok=True)
     sys.path.append('/hdd/Codes/rotation3d/')
     from lsm.inference import load
-    lsm_model  = load(args.lsm_checkpoint_path, strict=False)[0]
+    lsm_model  = load(args.lsm_checkpoint_path, strict=False,map_location=device)[0]
     wav2vec2   = Wav2Vec2()
     lsm_model.eval()
     lsm_model.to(device)
@@ -154,12 +158,12 @@ def val(args, model, log_dir, current_iter):
             past_audio       = audio_feat_batch[:, :audio_history_len]  # [1, N, 768]
 
             # Run Diffusion
-            z_tgt_pred = model.sample(audio_or_feat=curr_audio, prev_motion_feat=z_src,
-                                        prev_audio_feat=past_audio)
+            outs = model.sample(audio_or_feat=curr_audio, prev_motion_feat=z_src, prev_audio_feat=past_audio)
+            z_tgt_pred = outs[0][:, -video_pred_len:]  # [1, N, 20]
 
             # Generate images
             src_encs = batch_broadcast(frame0_enc, len(video_batch))
-            z_d = z_tgt_pred[:, :len(video_batch)] - src_encs['z']  # [1, N, 20]
+            z_d = z_tgt_pred[0, :len(video_batch)] - src_encs['z']  # [N, 20]
             g_imgs = lsm_model.decoder(z_d, src_encs['feat'])['img'].clamp(-1, 1)
             frame_idx = 0
             for g_img in g_imgs:
@@ -170,167 +174,15 @@ def val(args, model, log_dir, current_iter):
             z_src = z_tgt_pred[:, -video_history_len:]  # [1, N, 20]
 
         frames = torch.cat(frames, dim=0)
-        frames = cu.range_2_255(frames).permute(0, 2, 3, 1).cpu().to(torch.uint8)
+        frames = ((frames+1)*127.5).permute(0, 2, 3, 1).cpu().to(torch.uint8)
 
         write_video(filename=str(out_dir / f'{video_file.parents[0].stem}_{video_file.stem}_eval.mp4'),
                     video_array=frames,
-                    fps=inference_model.fps,
+                    fps=25,
                     audio_array=audio.permute(1, 0).contiguous(),
-                    audio_fps=inference_model.audio_sample_rate,
+                    audio_fps=16000,
                     audio_codec='aac',
                     )
-
-
-    audio_unit = test_loader.dataset.audio_unit
-    predict_head_pose = not args.no_head_pose
-
-    loss_log = defaultdict(list)
-    for test_round in range(n_rounds):
-        for audio_pair, coef_pair in test_loader:
-            audio_pair = [audio.to(device) for audio in audio_pair]
-            coef_pair = [{x: coef_pair[i][x].to(device) for x in coef_pair[i]} for i in range(2)]
-            motion_coef_pair = [
-                utils.get_motion_coef(coef_pair[i], args.rot_repr, predict_head_pose) for i in range(2)
-            ]  # (N, L, 50+x)
-
-            # Extract audio features
-            if args.use_context_audio_feat:
-                audio_feat = model.extract_audio_feature(torch.cat(audio_pair, dim=1), args.n_motions * 2)  # (N, 2L, :)
-
-            loss_noise = 0
-            loss_exp = 0
-            loss_exp_v = 0
-            loss_exp_s = 0
-            loss_head_angle = 0
-            loss_head_vel = torch.tensor(0, device=device)
-            loss_head_smooth = torch.tensor(0, device=device)
-            loss_head_trans = 0
-            for i in range(2):
-                audio = audio_pair[i]  # (N, L_a)
-                motion_coef = motion_coef_pair[i]  # (N, L, 50+x)
-                batch_size = audio.shape[0]
-
-                # truncate input audio and motion according to trunc_prob
-                if (i == 0 and np.random.rand() < args.trunc_prob1) or (i != 0 and np.random.rand() < args.trunc_prob2):
-                    audio_in, motion_coef_in, end_idx = utils.truncate_motion_coef_and_audio(
-                        audio, motion_coef, args.n_motions, audio_unit, args.pad_mode)
-                    if args.use_context_audio_feat and i != 0:
-                        # use contextualized audio feature for the second clip
-                        audio_in = model.extract_audio_feature(torch.cat([audio_pair[i - 1], audio_in], dim=1),
-                                                               args.n_motions * 2)[:, -args.n_motions:]
-                else:
-                    if args.use_context_audio_feat:
-                        audio_in = audio_feat[:, i * args.n_motions:(i + 1) * args.n_motions]
-                    else:
-                        audio_in = audio
-                    motion_coef_in, end_idx = motion_coef, None
-
-                if args.use_indicator:
-                    if end_idx is not None:
-                        indicator = torch.arange(args.n_motions, device=device).expand(batch_size,
-                                                                                       -1) < end_idx.unsqueeze(1)
-                    else:
-                        indicator = torch.ones(batch_size, args.n_motions, device=device)
-                else:
-                    indicator = None
-
-                # Inference
-                if i == 0:
-                    noise, target, prev_motion_coef, prev_audio_feat = model(motion_coef_in, audio_in, indicator=indicator)
-                    if end_idx is not None:  # was truncated, needs to use the complete feature
-                        prev_motion_coef = motion_coef[:, -args.n_prev_motions:]
-                        if args.use_context_audio_feat:
-                            prev_audio_feat = audio_feat[:, args.n_motions - args.n_prev_motions:args.n_motions]
-                        else:
-                            with torch.no_grad():
-                                prev_audio_feat = model.extract_audio_feature(audio)[:, -args.n_prev_motions:]
-                    else:
-                        prev_motion_coef = prev_motion_coef[:, -args.n_prev_motions:]
-                        prev_audio_feat = prev_audio_feat[:, -args.n_prev_motions:]
-                else:
-                    noise, target, _, _ = model(motion_coef_in, audio_in, prev_motion_coef, prev_audio_feat, indicator=indicator)
-
-                loss_n, loss_exp, loss_exp_v, loss_exp_s, loss_ha, loss_hc, loss_hs, loss_ht = utils.compute_loss_new(args, i == 0, motion_coef_in, noise, target, prev_motion_coef, end_idx)
-
-                # simple loss
-                loss_noise = loss_noise + loss_n / 2
-
-                # exp-related loss 
-                loss_exp = loss_exp + loss_exp / 2
-                loss_exp_v = loss_exp_v + loss_exp_v / 2
-                loss_exp_s = loss_exp_s + loss_exp_s / 2
-                
-                # head pose loss 
-                if args.target == 'sample' and predict_head_pose and args.l_head_angle > 0:
-                    loss_head_angle = loss_head_angle + loss_ha / 2
-                if args.target == 'sample' and predict_head_pose and args.l_head_vel > 0 and loss_hc is not None:
-                    loss_head_vel = loss_head_vel + loss_hc / 2
-                if args.target == 'sample' and predict_head_pose and args.l_head_smooth > 0 and loss_hs is not None:
-                    loss_head_smooth = loss_head_smooth + loss_hs / 2
-                if args.target == 'sample' and predict_head_pose and args.l_head_trans > 0 and loss_ht is not None:
-                    # no need to divide by 2 because it only applies to the second clip
-                    loss_head_trans = loss_head_trans + loss_ht
-
-            loss_log['noise'].append(loss_noise.item())
-            loss = loss_noise
-            
-            loss_log['exp'].append(loss_exp.item() * args.l_exp)
-            loss = loss + args.l_exp * loss_exp
-
-            loss_log['exp_vel'].append(loss_exp_v.item() * args.l_exp_vel)
-            loss = loss + args.l_exp_vel * loss_exp_v
-
-            loss_log['exp_smooth'].append(loss_exp_s.item() * args.l_exp_smooth)
-            loss = loss + args.l_exp_smooth * loss_exp_s
-
-            if args.target == 'sample' and predict_head_pose and args.l_head_angle > 0:
-                loss_log['head_angle'].append(loss_head_angle.item() * args.l_head_angle)
-                loss = loss + args.l_head_angle * loss_head_angle
-
-            if args.target == 'sample' and predict_head_pose and args.l_head_vel > 0:
-                loss_log['head_vel'].append(loss_head_vel.item() * args.l_head_vel)
-                loss = loss + args.l_head_vel * loss_head_vel
-
-            if args.target == 'sample' and predict_head_pose and args.l_head_smooth > 0:
-                loss_log['head_smooth'].append(loss_head_smooth.item() * args.l_head_smooth)
-                loss = loss + args.l_head_smooth * loss_head_smooth
-
-            if args.target == 'sample' and predict_head_pose and args.l_head_trans > 0:
-                loss_log['head_trans'].append(loss_head_trans.item() * args.l_head_trans)
-                loss = loss + args.l_head_trans * loss_head_trans
-
-            loss_log['loss'].append(loss.item())
-
-    description = f'(Iter {current_iter:>6}) {mode} loss: [N: {np.mean(loss_log["noise"]):.3e}'
-    description += f", EX: {np.mean(loss_log['exp']):.3e}"
-    description += f", EX_V: {np.mean(loss_log['exp_vel']):.3e}"
-    description += f", EX_S: {np.mean(loss_log['exp_smooth']):.3e}"
-    if args.target == 'sample' and predict_head_pose and args.l_head_angle > 0:
-        description += f', HA: {np.mean(loss_log["head_angle"]):.3e}'
-    if args.target == 'sample' and predict_head_pose and args.l_head_vel > 0:
-        description += f', HV: {np.mean(loss_log["head_vel"]):.3e}'
-    if args.target == 'sample' and predict_head_pose and args.l_head_smooth > 0:
-        description += f', HS: {np.mean(loss_log["head_smooth"]):.3e}'
-    if args.target == 'sample' and predict_head_pose and args.l_head_trans > 0:
-        description += f', HT: {np.mean(loss_log["head_trans"]):.3e}'
-    description += ']'
-    print(description)
-
-    # write to tensorboard
-    if writer is not None:
-        writer.add_scalar(f'{mode}/total_loss', np.mean(loss_log['loss']), current_iter)
-        writer.add_scalar(f'{mode}/simplt_loss', np.mean(loss_log['noise']), current_iter)
-        writer.add_scalar('train/exp_loss', np.mean(loss_log['exp']), current_iter)
-        writer.add_scalar('train/exp_vel_loss', np.mean(loss_log['exp_vel']), current_iter)
-        writer.add_scalar('train/exp_smooth_loss', np.mean(loss_log['exp_smooth']), current_iter)
-        if args.target == 'sample' and predict_head_pose and args.l_head_angle > 0:
-            writer.add_scalar(f'{mode}/head_angle', np.mean(loss_log['head_angle']), current_iter)
-        if args.target == 'sample' and predict_head_pose and args.l_head_vel > 0:
-            writer.add_scalar(f'{mode}/head_vel', np.mean(loss_log['head_vel']), current_iter)
-        if args.target == 'sample' and predict_head_pose and args.l_head_smooth > 0:
-            writer.add_scalar(f'{mode}/head_smooth', np.mean(loss_log['head_smooth']), current_iter)
-        if args.target == 'sample' and predict_head_pose and args.l_head_trans > 0:
-            writer.add_scalar(f'{mode}/head_trans', np.mean(loss_log['head_trans']), current_iter)
 
     if is_training:
         model.train()
@@ -364,7 +216,9 @@ def main(args, option_text=None):
     # Dataset
     from src.lsm_audio2video.dataset import LEAPFeatsDataset
     train_dataset = LEAPFeatsDataset(root_dir=args.data_root_dir, leap_av_clips_dir=args.leap_av_clips_dir)
-    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=False)
+    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                   num_workers=args.num_workers, pin_memory=False,
+                                   generator = torch.Generator(device=device))
 
     # Logging
     exp_dir = Path(args.data_root_dir).parents[1]/f'{args.exp_name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}'

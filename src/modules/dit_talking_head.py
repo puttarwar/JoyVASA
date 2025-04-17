@@ -223,6 +223,12 @@ class DitTalkingHead(nn.Module):
     def sample(self, audio_or_feat, prev_motion_feat=None, prev_audio_feat=None,
                motion_at_T=None, indicator=None, cfg_mode=None, cfg_cond=None, cfg_scale=1.15, flexibility=0,
                dynamic_threshold=None, ret_traj=False):
+
+        # Map audio features
+        audio_or_feat = self.audio_feature_map(audio_or_feat)
+        if prev_audio_feat is not None:
+            prev_audio_feat = self.audio_feature_map(prev_audio_feat)
+
         # Check and convert inputs
         batch_size = audio_or_feat.shape[0]
 
