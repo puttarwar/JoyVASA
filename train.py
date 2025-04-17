@@ -104,7 +104,7 @@ def train(args, model, train_loader, optimizer, save_dir, scheduler=None, writer
 
 
 @torch.no_grad()
-def val(args, model, log_dir, current_iter):
+def val(args, model, log_dir, current_iter, num_videos=10):
     print(f' Testing iteration {current_iter}...')
     is_training = model.training
     device = model.device
@@ -120,7 +120,7 @@ def val(args, model, log_dir, current_iter):
     lsm_model.eval()
     lsm_model.to(device)
     wav2vec2.to(device)
-    video_files = sorted(list(Path(args.leap_test_dir).rglob('**/*.mp4')))
+    video_files = sorted(list(Path(args.leap_test_dir).rglob('**/*.mp4')))[:num_videos]
 
     # ------------ SETUP PARAMETERS ------------
     video_pred_len          = 25
@@ -156,6 +156,9 @@ def val(args, model, log_dir, current_iter):
                                               int(window_idx * audio_feat_len * 0.5) + audio_feat_len]  # [1, N, 768]
             curr_audio       = audio_feat_batch[:, -audio_pred_len:]  # [1, N, 768]
             past_audio       = audio_feat_batch[:, :audio_history_len]  # [1, N, 768]
+
+            if curr_audio.shape[1] != audio_pred_len:
+                continue
 
             # Run Diffusion
             outs = model.sample(audio_or_feat=curr_audio, prev_motion_feat=z_src, prev_audio_feat=past_audio)
