@@ -183,11 +183,14 @@ class LivePortraitPipeline(object):
 
         # save the animated result
         mkdir(args.output_dir)
-        temp_video = osp.join(args.output_dir, f'{basename(args.reference)}_{basename(args.audio)}_temp.mp4')
-        if I_p_pstbk_lst is not None and len(I_p_pstbk_lst) > 0:
-            images2video(I_p_pstbk_lst, wfp=temp_video, fps=inf_cfg.output_fps)
-        else:
-            images2video(I_p_lst, wfp=temp_video, fps=inf_cfg.output_fps)
         final_video = osp.join(args.output_dir, f'{basename(args.reference)}_{basename(args.audio)}.mp4')
-        add_audio_to_video(temp_video, args.audio, final_video)
+
+        # Write video using write_video
+        from torchvision.io import write_video
+        import torchaudio
+        import numpy as np
+        audio_waveform, audio_sample_rate = torchaudio.load(args.audio)
+        write_video(filename=final_video, video_array=torch.Tensor(np.stack(I_p_lst)), fps=inf_cfg.output_fps,
+                    audio_array=audio_waveform.contiguous(), audio_fps=audio_sample_rate, audio_codec="aac", )
+
         return final_video
