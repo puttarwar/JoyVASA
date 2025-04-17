@@ -1,3 +1,14 @@
+'''
+Trains and evaluates JoyVASA model using LSM backbone instead of LivePortraits.
+
+Usage:
+
+python train.py --data_root_dir /path/to/lsm_checkpoint/a2v_dataset/dataset \
+                --leap_av_clips_dir /path/to/leap_av_clips \
+                --lsm_checkpoint_path /path/to/lsm_checkpoint \
+                --leap_test_dir /path/to/leap_test_dir \
+'''
+
 import argparse
 from collections import deque, defaultdict
 from pathlib import Path
@@ -13,8 +24,11 @@ from torch.utils import data
 from datetime import datetime
 import src.utils as utils
 from src.dataset import infinite_data_loader
-from src.dataset.talkinghead_dataset_hungry import TalkingHeadDatasetHungry
 from src.modules.dit_talking_head import DitTalkingHead
+import glob
+from more_itertools import batched
+from src.lsm_audio2video.audio_processors.wave2vec2 import Wav2Vec2
+from src.lsm_audio2video.utils.utils import get_leap_clip_data, batch_broadcast
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -83,16 +97,89 @@ def train(args, model, train_loader, optimizer, save_dir, scheduler=None, writer
             }, save_dir / f'iter_{it:07}.pt')
 
         # validation
-        # if (it % args.val_iter == 0 or it == 0) or it == args.max_iter:
-        #     val(args, model, val_loader, it, 1, 'val', writer)
+        if (it % args.val_iter == 0 or it == 0) or it == args.max_iter:
+            val(args, model, save_dir, it)
 
 
 @torch.no_grad()
-def val(args, model, test_loader, current_iter, n_rounds=1, mode='val', writer=None):
-    print("test ... ")
+def val(args, model, log_dir, current_iter):
+    print(f' Testing iteration {current_iter}...')
     is_training = model.training
     device = model.device
     model.eval()
+
+    #  ------------ SETUP (LSM MODEL, DATA) ------------
+    sys.path.append('/hdd/Codes/rotation3d/')
+    from lsm.inference import load
+    lsm_model  = load(args.lsm_checkpoint_path, strict=False)[0]
+    wav2vec2   = Wav2Vec2()
+    lsm_model.eval()
+    lsm_model.to(device)
+    wav2vec2.to(device)
+    video_files = sorted(list(Path(args.leap_test_dir).rglob('**/*.mp4')))
+
+    # ------------ SETUP PARAMETERS ------------
+    video_pred_len          = 25
+    video_history_len       = 25
+    audio_pred_len          = 50
+    audio_history_len       = 50
+    audio_feat_len          = 100
+
+
+    for video_file in video_files:
+        video, audio = get_leap_clip_data(video_file, device)
+        print(f'Processing {video_file}...')
+
+        # Extract audio features
+        audio_feats = wav2vec2(audio[None,:,0])  # (1, L, 768)
+
+        # Extract zs
+        frame0 = video[0, None]
+        frame0_enc = lsm_model.lsm_model.encoder(frame0)
+        z_src = None
+
+        z_outs = []
+        frames = []
+        for window_idx, video_batch in enumerate(batched(video, video_pred_len)):
+
+            # Preprocess
+            video_batch = torch.stack(video_batch)
+            if z_src is None:
+                z_tgts = lsm_model.encoder(video_batch)['z'].unsqueeze(0)  # [1, N, 20]
+                z_src = z_tgts[:, -video_history_len:]  # [1, N, 20]
+
+            audio_feat_batch = audio_feats[:, int(window_idx * audio_feat_len * 0.5): \
+                                              int(window_idx * audio_feat_len * 0.5) + audio_feat_len]  # [1, N, 768]
+            curr_audio       = audio_feat_batch[:, -audio_pred_len:]  # [1, N, 768]
+            past_audio       = audio_feat_batch[:, :audio_history_len]  # [1, N, 768]
+
+            # Run Diffusion
+            z_tgt_pred = model.sample(audio_or_feat=curr_audio, prev_motion_feat=z_src,
+                                        prev_audio_feat=past_audio)
+
+            # Generate images
+            src_encs = batch_broadcast(frame0_enc, len(video_batch))
+            z_d = z_tgt_pred[:, :len(video_batch)] - src_encs['z']  # [1, N, 20]
+            g_imgs = lsm_model.decoder(z_d, src_encs['feat'])['img'].clamp(-1, 1)
+            frame_idx = 0
+            for g_img in g_imgs:
+                frames.append(torch.cat([frame0, video_batch[frame_idx, None], g_img[None, ...]], dim=-1))
+                frame_idx += 1
+
+            # Repeat
+            z_src = z_tgt_pred[:, -video_history_len:]  # [1, N, 20]
+
+        frames = torch.cat(frames, dim=0)
+        frames = cu.range_2_255(frames).permute(0, 2, 3, 1).cpu().to(torch.uint8)
+
+        write_video(filename=str(out_dir / f'{video_file.parents[0].stem}_{video_file.stem}_eval.mp4'),
+                    video_array=frames,
+                    fps=inference_model.fps,
+                    audio_array=audio.permute(1, 0).contiguous(),
+                    audio_fps=inference_model.audio_sample_rate,
+                    audio_codec='aac',
+                    )
+
 
     audio_unit = test_loader.dataset.audio_unit
     predict_head_pose = not args.no_head_pose
@@ -280,7 +367,7 @@ def main(args, option_text=None):
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=False)
 
     # Logging
-    exp_dir = Path(args.data_root_dir).parents[1]/f'{args.exp_name}_{datetime.now().strftime("%Y%m%d_%H_%M_%S")}'
+    exp_dir = Path(args.data_root_dir).parents[1]/f'{args.exp_name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
     log_dir = exp_dir
     log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(str(log_dir))
@@ -326,6 +413,10 @@ if __name__ == '__main__':
     parser.add_argument('--leap_av_clips_dir', type=Path, required=True,)
     parser.add_argument('--batch_size', type=int, default=16, help='batch size')
     parser.add_argument('--num_workers', type=int, default=4, help='number of workers for dataloader')
+
+    # Testing
+    parser.add_argument('--lsm_checkpoint_path', required=True, type=str, help='path to the lsm checkpoint')
+    parser.add_argument('--leap_test_dir', required=True, type=str, help='path to the leap test directory')
 
     # Model
     parser.add_argument('--target', type=str, default='sample', choices=['sample', 'noise'])
